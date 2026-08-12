@@ -1,0 +1,92 @@
+name: Deploy AWS data pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  STACK_NAME: s3-lambda-glue-pipeline
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Package application code
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/lambda build/glue
+
+          (
+            cd lambda
+            zip -q -r ../build/lambda/lambda.zip handler.py
+          )
+
+          cp glue/job.py build/glue/job.py
+
+      - name: Deploy CloudFormation stack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws cloudformation deploy \
+            --template-file cfn/pipeline.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM
+
+      - name: Upload Glue script and Lambda package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text)
+
+          aws s3 cp build/glue/job.py "s3://${BUCKET}/glue/job.py"
+          aws s3 cp build/lambda/lambda.zip "s3://${BUCKET}/artifacts/lambda.zip"
+
+      - name: Update Lambda code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text)
+
+          aws lambda update-function-code \
+            --function-name "${STACK_NAME}-schema-validator" \
+            --s3-bucket "$BUCKET" \
+            --s3-key artifacts/lambda.zip \
+            --publish
+
+      - name: Show deployment outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table

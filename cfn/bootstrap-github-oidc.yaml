@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: One-time GitHub Actions OIDC bootstrap role.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization/user that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name without owner or .git.
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch allowed to assume the GitHub Actions deployment role.
+
+Resources:
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-github-actions"
+      Description: Deployment role assumed by GitHub Actions using OIDC.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+      ManagedPolicyArns:
+        # Demo/bootstrap policy. Replace with a least-privilege deployment policy
+        # in production.
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+Outputs:
+  GitHubActionsRoleArn:
+    Description: Put this ARN in the GitHub repository variable AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt GitHubActionsDeployRole.Arn

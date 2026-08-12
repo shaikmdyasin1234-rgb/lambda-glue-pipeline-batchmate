@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: S3 -> Lambda schema validation -> Glue ETL pipeline.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: ""
+    Description: Optional globally unique S3 bucket name. Leave empty to generate one.
+
+Conditions:
+  HasBucketName: !Not
+    - !Equals
+      - !Ref BucketName
+      - ""
+
+Resources:
+
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - LambdaInvokePermission
+    Properties:
+      BucketName: !If
+        - HasBucketName
+        - !Ref BucketName
+        - !Ref AWS::NoValue
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LambdaFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: landing/
+                  - Name: suffix
+                    Value: .csv
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "${PipelineBucket.Arn}/landing/*"
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${AWS::StackName}-etl"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-schema-validator"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Sub "${AWS::StackName}-etl"
+          OUTPUT_PREFIX: output/
+          REQUIRED_COLUMNS: city,state,country
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              raise RuntimeError(
+                  "Placeholder Lambda. GitHub Actions uploads the real Lambda package."
+              )
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt PipelineBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-glue"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PipelineBucket.Arn
+                  - !Sub "${PipelineBucket.Arn}/landing/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PipelineBucket.Arn
+                  - !Sub "${PipelineBucket.Arn}/output/*"
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${AWS::StackName}-etl"
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      ExecutionProperty:
+        MaxConcurrentRuns: 2
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${PipelineBucket}/glue/job.py"
+      DefaultArguments:
+        "--job-language": "python"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+
+Outputs:
+  BucketName:
+    Description: Pipeline S3 bucket.
+    Value: !Ref PipelineBucket
+
+  LambdaName:
+    Description: Schema validation Lambda.
+    Value: !Ref LambdaFunction
+
+  GlueJobName:
+    Description: Glue ETL job.
+    Value: !Ref GlueJob
