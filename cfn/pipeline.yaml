@@ -16,14 +16,12 @@ Conditions:
 
 Resources:
 
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
   # S3 BUCKET
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
 
   PipelineBucket:
     Type: AWS::S3::Bucket
-    DependsOn:
-      - LambdaInvokePermission
     Properties:
       BucketName: !If
         - HasBucketName
@@ -38,21 +36,9 @@ Resources:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
 
-      NotificationConfiguration:
-        LambdaConfigurations:
-          - Event: s3:ObjectCreated:*
-            Function: !GetAtt LambdaFunction.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: landing/
-                  - Name: suffix
-                    Value: .csv
-
-  # ---------------------------------------------------------------------------
-  # LAMBDA IAM ROLE
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # LAMBDA EXECUTION ROLE
+  # ===========================================================================
 
   LambdaRole:
     Type: AWS::IAM::Role
@@ -75,7 +61,6 @@ Resources:
 
             Statement:
 
-              # CloudWatch Logs
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
@@ -83,26 +68,21 @@ Resources:
                   - logs:PutLogEvents
                 Resource: "*"
 
-              # S3 access
-              #
-              # Wildcard is intentionally used here to avoid a CloudFormation
-              # circular dependency between the bucket and Lambda role.
               - Effect: Allow
                 Action:
                   - s3:GetObject
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::*/*"
 
-              # Start Glue job
               - Effect: Allow
                 Action:
                   - glue:StartJobRun
                 Resource:
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${AWS::StackName}-etl"
 
-  # ---------------------------------------------------------------------------
-  # LAMBDA FUNCTION
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # MAIN LAMBDA FUNCTION
+  # ===========================================================================
 
   LambdaFunction:
     Type: AWS::Lambda::Function
@@ -132,25 +112,214 @@ Resources:
                   "Placeholder Lambda. GitHub Actions uploads the real Lambda package."
               )
 
-  # ---------------------------------------------------------------------------
-  # ALLOW S3 TO INVOKE LAMBDA
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # PERMISSION FOR S3 TO INVOKE MAIN LAMBDA
+  # ===========================================================================
 
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
+
     Properties:
       FunctionName: !Ref LambdaFunction
+
       Action: lambda:InvokeFunction
+
       Principal: s3.amazonaws.com
-      SourceArn: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-pipeline"
+
+      SourceArn: !GetAtt PipelineBucket.Arn
+
       SourceAccount: !Ref AWS::AccountId
 
-  # ---------------------------------------------------------------------------
-  # GLUE IAM ROLE
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # ROLE USED BY THE CUSTOM RESOURCE
+  # ===========================================================================
+
+  NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-notification"
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: ConfigureS3Notification
+          PolicyDocument:
+            Version: "2012-10-17"
+
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                Resource:
+                  - !GetAtt PipelineBucket.Arn
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ===========================================================================
+  # CUSTOM RESOURCE LAMBDA
+  # ===========================================================================
+  #
+  # This Lambda configures the S3 -> Lambda notification only AFTER:
+  #
+  #   1. S3 bucket exists
+  #   2. Main Lambda exists
+  #   3. S3 invoke permission exists
+  #
+  # This avoids the CloudFormation/S3 circular dependency.
+  # ===========================================================================
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-s3-notification"
+
+      Runtime: python3.12
+
+      Handler: index.handler
+
+      Role: !GetAtt NotificationRole.Arn
+
+      Timeout: 60
+
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+
+          s3 = boto3.client("s3")
+
+          def send_response(event, context, status, data, physical_id):
+              response_body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log Stream: " + context.log_stream_name,
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data
+              })
+
+              response_url = event["ResponseURL"]
+
+              request = urllib.request.Request(
+                  response_url,
+                  data=response_body.encode("utf-8"),
+                  headers={
+                      "content-type": "",
+                      "content-length": str(len(response_body))
+                  },
+                  method="PUT"
+              )
+
+              with urllib.request.urlopen(request) as response:
+                  response.read()
+
+          def handler(event, context):
+              bucket = event["ResourceProperties"]["BucketName"]
+              function_arn = event["ResourceProperties"]["FunctionArn"]
+
+              physical_id = f"{bucket}-lambda-notification"
+
+              try:
+                  request_type = event["RequestType"]
+
+                  if request_type in ("Create", "Update"):
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={
+                              "LambdaFunctionConfigurations": [
+                                  {
+                                      "LambdaFunctionArn": function_arn,
+                                      "Events": [
+                                          "s3:ObjectCreated:*"
+                                      ],
+                                      "Filter": {
+                                          "Key": {
+                                              "FilterRules": [
+                                                  {
+                                                      "Name": "prefix",
+                                                      "Value": "landing/"
+                                                  },
+                                                  {
+                                                      "Name": "suffix",
+                                                      "Value": ".csv"
+                                                  }
+                                              ]
+                                          }
+                                      }
+                                  }
+                              ]
+                          }
+                      )
+
+                  elif request_type == "Delete":
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+
+                  send_response(
+                      event,
+                      context,
+                      "SUCCESS",
+                      {
+                          "BucketName": bucket
+                      },
+                      physical_id
+                  )
+
+              except Exception as error:
+                  print("ERROR:", str(error))
+
+                  send_response(
+                      event,
+                      context,
+                      "FAILED",
+                      {
+                          "Error": str(error)
+                      },
+                      physical_id
+                  )
+
+  # ===========================================================================
+  # CUSTOM RESOURCE
+  # ===========================================================================
+
+  ConfigureS3Notification:
+    Type: Custom::S3LambdaNotification
+
+    DependsOn:
+      - LambdaInvokePermission
+
+    Properties:
+      ServiceToken: !GetAtt NotificationFunction.Arn
+
+      BucketName: !Ref PipelineBucket
+
+      FunctionArn: !GetAtt LambdaFunction.Arn
+
+  # ===========================================================================
+  # GLUE EXECUTION ROLE
+  # ===========================================================================
 
   GlueRole:
     Type: AWS::IAM::Role
+
     Properties:
       RoleName: !Sub "${AWS::StackName}-glue"
 
@@ -168,12 +337,12 @@ Resources:
 
       Policies:
         - PolicyName: S3DataAccess
+
           PolicyDocument:
             Version: "2012-10-17"
 
             Statement:
 
-              # Read input data
               - Effect: Allow
                 Action:
                   - s3:GetObject
@@ -182,7 +351,6 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:s3:::*"
                   - !Sub "arn:${AWS::Partition}:s3:::*/*"
 
-              # Write output data
               - Effect: Allow
                 Action:
                   - s3:PutObject
@@ -192,9 +360,9 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:s3:::*"
                   - !Sub "arn:${AWS::Partition}:s3:::*/*"
 
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
   # GLUE JOB
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
 
   GlueJob:
     Type: AWS::Glue::Job
@@ -215,6 +383,7 @@ Resources:
 
       Command:
         Name: glueetl
+
         PythonVersion: "3"
 
         ScriptLocation: !Sub "s3://${PipelineBucket}/glue/job.py"
@@ -224,9 +393,9 @@ Resources:
         "--enable-metrics": "true"
         "--enable-continuous-cloudwatch-log": "true"
 
-# -----------------------------------------------------------------------------
+# ============================================================================
 # OUTPUTS
-# -----------------------------------------------------------------------------
+# ============================================================================
 
 Outputs:
 
