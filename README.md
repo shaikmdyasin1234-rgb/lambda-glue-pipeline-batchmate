@@ -254,3 +254,8 @@ For production, consider adding:
 - CloudWatch alarms
 - separate dev/stage/prod stacks
 - a pre-created OIDC deployment role with a least-privilege deployment policy
+## Git workflow
+
+Development changes are made on a feature branch, reviewed through a Pull Request, and merged into `main`.
+
+The `main` branch is the deployment branch for the AWS pipeline.
