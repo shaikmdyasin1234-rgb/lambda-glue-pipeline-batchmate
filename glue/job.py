@@ -26,6 +26,7 @@ job.init(args["JOB_NAME"], args)
 input_path = args["INPUT_PATH"]
 output_path = args["OUTPUT_PATH"]
 
+# Read the input CSV.
 df = (
     spark.read
     .option("header", "true")
@@ -33,6 +34,7 @@ df = (
     .csv(input_path)
 )
 
+# Validate required columns.
 required_columns = {"city", "state", "country"}
 actual_columns = {column.strip().lower() for column in df.columns}
 missing = required_columns - actual_columns
@@ -40,24 +42,58 @@ missing = required_columns - actual_columns
 if missing:
     raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-# Normalize the partition columns without changing the other data columns.
-for column in ["city", "state", "country"]:
-    matching_column = next(
-        c for c in df.columns if c.strip().lower() == column
-    )
-    df = df.withColumn(
-        matching_column,
-        F.trim(F.col(matching_column).cast("string")),
-    )
+# Find the actual column names while allowing different capitalization.
+column_map = {
+    column.strip().lower(): column
+    for column in df.columns
+}
 
-# The output is physically partitioned as:
-# output/city=<city>/state=<state>/country=<country>/part-*.parquet
+city_column = column_map["city"]
+state_column = column_map["state"]
+country_column = column_map["country"]
+
+# Clean the three required columns.
+df = (
+    df
+    .withColumn(
+        city_column,
+        F.trim(F.col(city_column).cast("string"))
+    )
+    .withColumn(
+        state_column,
+        F.trim(F.col(state_column).cast("string"))
+    )
+    .withColumn(
+        country_column,
+        F.trim(F.col(country_column).cast("string"))
+    )
+)
+
+# Write city output.
 (
-    df.write
-    .mode("append")
-    .format("parquet")
-    .partitionBy("city", "state", "country")
-    .save(output_path)
+    df.select(city_column)
+    .write
+    .mode("overwrite")
+    .option("header", "true")
+    .csv(f"{output_path}/city")
+)
+
+# Write state output.
+(
+    df.select(state_column)
+    .write
+    .mode("overwrite")
+    .option("header", "true")
+    .csv(f"{output_path}/state")
+)
+
+# Write country output.
+(
+    df.select(country_column)
+    .write
+    .mode("overwrite")
+    .option("header", "true")
+    .csv(f"{output_path}/country")
 )
 
 job.commit()
