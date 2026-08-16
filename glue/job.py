@@ -1,6 +1,6 @@
-```python
 import sys
 
+import boto3
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -8,6 +8,9 @@ from pyspark.context import SparkContext
 from pyspark.sql import functions as F
 
 
+# ---------------------------------------------------------
+# Job arguments
+# ---------------------------------------------------------
 args = getResolvedOptions(
     sys.argv,
     [
@@ -17,17 +20,27 @@ args = getResolvedOptions(
     ],
 )
 
+job_name = args["JOB_NAME"]
+input_path = args["INPUT_PATH"]
+output_path = args["OUTPUT_PATH"].rstrip("/")
+
+
+# ---------------------------------------------------------
+# Start Glue / Spark
+# ---------------------------------------------------------
 sc = SparkContext()
 glue_context = GlueContext(sc)
 spark = glue_context.spark_session
 
 job = Job(glue_context)
-job.init(args["JOB_NAME"], args)
+job.init(job_name, args)
 
-input_path = args["INPUT_PATH"]
-output_path = args["OUTPUT_PATH"]
 
-# Read the input CSV.
+# ---------------------------------------------------------
+# Read input CSV
+# ---------------------------------------------------------
+print(f"Reading input file: {input_path}")
+
 df = (
     spark.read
     .option("header", "true")
@@ -35,25 +48,38 @@ df = (
     .csv(input_path)
 )
 
-# Validate required columns.
+print(f"Input columns: {df.columns}")
+
+
+# ---------------------------------------------------------
+# Validate required columns
+# ---------------------------------------------------------
 required_columns = {"city", "state", "country"}
-actual_columns = {column.strip().lower() for column in df.columns}
-missing = required_columns - actual_columns
 
-if missing:
-    raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-# Find the actual column names while allowing different capitalization.
 column_map = {
     column.strip().lower(): column
     for column in df.columns
 }
 
+missing_columns = required_columns - set(column_map.keys())
+
+if missing_columns:
+    raise ValueError(
+        f"Missing required columns: {sorted(missing_columns)}"
+    )
+
+
+# ---------------------------------------------------------
+# Get actual column names
+# ---------------------------------------------------------
 city_column = column_map["city"]
 state_column = column_map["state"]
 country_column = column_map["country"]
 
-# Clean the three required columns.
+
+# ---------------------------------------------------------
+# Clean required columns
+# ---------------------------------------------------------
 df = (
     df
     .withColumn(
@@ -70,32 +96,60 @@ df = (
     )
 )
 
-# Write city output.
+
+# ---------------------------------------------------------
+# Output paths
+# ---------------------------------------------------------
+city_output = f"{output_path}/city"
+state_output = f"{output_path}/state"
+country_output = f"{output_path}/country"
+
+
+# ---------------------------------------------------------
+# Write CITY output
+# ---------------------------------------------------------
+print(f"Writing city output: {city_output}")
+
 (
     df.select(city_column)
     .write
     .mode("overwrite")
     .option("header", "true")
-    .csv(f"{output_path}/city")
+    .csv(city_output)
 )
 
-# Write state output.
+
+# ---------------------------------------------------------
+# Write STATE output
+# ---------------------------------------------------------
+print(f"Writing state output: {state_output}")
+
 (
     df.select(state_column)
     .write
     .mode("overwrite")
     .option("header", "true")
-    .csv(f"{output_path}/state")
+    .csv(state_output)
 )
 
-# Write country output.
+
+# ---------------------------------------------------------
+# Write COUNTRY output
+# ---------------------------------------------------------
+print(f"Writing country output: {country_output}")
+
 (
     df.select(country_column)
     .write
     .mode("overwrite")
     .option("header", "true")
-    .csv(f"{output_path}/country")
+    .csv(country_output)
 )
 
+
+# ---------------------------------------------------------
+# Finish Glue job
+# ---------------------------------------------------------
+print("Glue ETL job completed successfully.")
+
 job.commit()
-```
